@@ -170,7 +170,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             ):
                 # Sample a new noise matrix
                 self.policy.reset_noise(env.num_envs)
-
+            compute_action_start = time.process_time()
             with th.no_grad():
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
@@ -184,11 +184,11 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                 clipped_actions = np.clip(
                     actions, self.action_space.low, self.action_space.high
                 )
-
             new_obs, rewards, dones, infos = env.step(clipped_actions)
+            self.env_step_time += time.process_time() - start_env_step_time
 
             self.num_timesteps += env.num_envs
-
+            start_truc = time.process_time()
             # Give access to local variables
             callback.update_locals(locals())
             if callback.on_step() is False:
@@ -215,11 +215,13 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             # Compute value for the last timestep
             obs_tensor = obs_as_tensor(new_obs, self.device)
             _, values, _ = self.policy.forward(obs_tensor)
-
+        start_compute_returns_and_advantages = time.process_time()
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
         callback.on_rollout_end()
-
+        self.start_compute_returns_and_advantages_time += (
+            time.process_time() - start_compute_returns_and_advantages
+        )
         return True
 
     def train(self) -> None:
@@ -253,10 +255,21 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             reset_num_timesteps,
             tb_log_name,
         )
-
+        start_total_time = time.process_time()
         callback.on_training_start(locals(), globals())
-
+        collect_time = 0
+        train_time = 0
+        total_time = 0
+        self.env_step_time = 0
+        self.start_compute_returns_and_advantages_time = 0
+        self.add_time = 0
+        self.truc_time = 0
+        self.compute_action_time = 0
         while self.num_timesteps < total_timesteps:
+            start_collection = time.process_time()
+            continue_training = self.collect_rollouts(
+                self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps
+            )
 
             continue_training = self.collect_rollouts(
                 self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps
@@ -296,7 +309,18 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             print(f"train time : {time.process_time()-start_train}")
 
         callback.on_training_end()
-
+        total_time = time.process_time() - start_total_time
+        print("total time", total_time)
+        print("train time", train_time)
+        print("collect time", collect_time)
+        print("env step time", self.env_step_time)
+        print(
+            "compute advantage and returns",
+            self.start_compute_returns_and_advantages_time,
+        )
+        print("add  time", self.add_time)
+        print("truc  time", self.truc_time)
+        print("action  time", self.compute_action_time)
         return self
 
     def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
