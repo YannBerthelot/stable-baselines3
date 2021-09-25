@@ -106,7 +106,11 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         self._setup_lr_schedule()
         self.set_random_seed(self.seed)
 
-        buffer_cls = DictRolloutBuffer if isinstance(self.observation_space, gym.spaces.Dict) else RolloutBuffer
+        buffer_cls = (
+            DictRolloutBuffer
+            if isinstance(self.observation_space, gym.spaces.Dict)
+            else RolloutBuffer
+        )
 
         self.rollout_buffer = buffer_cls(
             self.n_steps,
@@ -159,10 +163,14 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         callback.on_rollout_start()
 
         while n_steps < n_rollout_steps:
-            if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
+            if (
+                self.use_sde
+                and self.sde_sample_freq > 0
+                and n_steps % self.sde_sample_freq == 0
+            ):
                 # Sample a new noise matrix
                 self.policy.reset_noise(env.num_envs)
-
+            compute_action_start = time.process_time()
             with th.no_grad():
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
@@ -173,12 +181,16 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             clipped_actions = actions
             # Clip the actions to avoid out of bound error
             if isinstance(self.action_space, gym.spaces.Box):
-                clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
-
+                clipped_actions = np.clip(
+                    actions, self.action_space.low, self.action_space.high
+                )
+            self.compute_action_time += time.process_time() - compute_action_start
+            start_env_step_time = time.process_time()
             new_obs, rewards, dones, infos = env.step(clipped_actions)
+            self.env_step_time += time.process_time() - start_env_step_time
 
             self.num_timesteps += env.num_envs
-
+            start_truc = time.process_time()
             # Give access to local variables
             callback.update_locals(locals())
             if callback.on_step() is False:
@@ -190,7 +202,18 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             if isinstance(self.action_space, gym.spaces.Discrete):
                 # Reshape in case of discrete action
                 actions = actions.reshape(-1, 1)
-            rollout_buffer.add(self._last_obs, actions, rewards, self._last_episode_starts, values, log_probs)
+            self.truc_time += time.process_time() - start_truc
+            start_add = time.process_time()
+            rollout_buffer.add(
+                self._last_obs,
+                actions,
+                rewards,
+                self._last_episode_starts,
+                values,
+                log_probs,
+            )
+            self.add_time += time.process_time() - start_add
+
             self._last_obs = new_obs
             self._last_episode_starts = dones
 
@@ -198,11 +221,13 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             # Compute value for the last timestep
             obs_tensor = obs_as_tensor(new_obs, self.device)
             _, values, _ = self.policy.forward(obs_tensor)
-
+        start_compute_returns_and_advantages = time.process_time()
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
         callback.on_rollout_end()
-
+        self.start_compute_returns_and_advantages_time += (
+            time.process_time() - start_compute_returns_and_advantages
+        )
         return True
 
     def train(self) -> None:
@@ -227,14 +252,32 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         iteration = 0
 
         total_timesteps, callback = self._setup_learn(
-            total_timesteps, eval_env, callback, eval_freq, n_eval_episodes, eval_log_path, reset_num_timesteps, tb_log_name
+            total_timesteps,
+            eval_env,
+            callback,
+            eval_freq,
+            n_eval_episodes,
+            eval_log_path,
+            reset_num_timesteps,
+            tb_log_name,
         )
-
+        start_total_time = time.process_time()
         callback.on_training_start(locals(), globals())
-
+        collect_time = 0
+        train_time = 0
+        total_time = 0
+        self.env_step_time = 0
+        self.start_compute_returns_and_advantages_time = 0
+        self.add_time = 0
+        self.truc_time = 0
+        self.compute_action_time = 0
         while self.num_timesteps < total_timesteps:
+            start_collection = time.process_time()
+            continue_training = self.collect_rollouts(
+                self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps
+            )
 
-            continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps)
+            collect_time += time.process_time() - start_collection
 
             if continue_training is False:
                 break
@@ -247,17 +290,41 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                 fps = int(self.num_timesteps / (time.time() - self.start_time))
                 self.logger.record("time/iterations", iteration, exclude="tensorboard")
                 if len(self.ep_info_buffer) > 0 and len(self.ep_info_buffer[0]) > 0:
-                    self.logger.record("rollout/ep_rew_mean", safe_mean([ep_info["r"] for ep_info in self.ep_info_buffer]))
-                    self.logger.record("rollout/ep_len_mean", safe_mean([ep_info["l"] for ep_info in self.ep_info_buffer]))
+                    self.logger.record(
+                        "rollout/ep_rew_mean",
+                        safe_mean([ep_info["r"] for ep_info in self.ep_info_buffer]),
+                    )
+                    self.logger.record(
+                        "rollout/ep_len_mean",
+                        safe_mean([ep_info["l"] for ep_info in self.ep_info_buffer]),
+                    )
                 self.logger.record("time/fps", fps)
-                self.logger.record("time/time_elapsed", int(time.time() - self.start_time), exclude="tensorboard")
-                self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
+                self.logger.record(
+                    "time/time_elapsed",
+                    int(time.time() - self.start_time),
+                    exclude="tensorboard",
+                )
+                self.logger.record(
+                    "time/total_timesteps", self.num_timesteps, exclude="tensorboard"
+                )
                 self.logger.dump(step=self.num_timesteps)
-
+            start_train = time.process_time()
             self.train()
+            train_time += time.process_time() - start_train
 
         callback.on_training_end()
-
+        total_time = time.process_time() - start_total_time
+        print("total time", total_time)
+        print("train time", train_time)
+        print("collect time", collect_time)
+        print("env step time", self.env_step_time)
+        print(
+            "compute advantage and returns",
+            self.start_compute_returns_and_advantages_time,
+        )
+        print("add  time", self.add_time)
+        print("truc  time", self.truc_time)
+        print("action  time", self.compute_action_time)
         return self
 
     def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
