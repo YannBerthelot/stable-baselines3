@@ -529,7 +529,7 @@ class BaseAlgorithm(ABC):
 
         :param total_timesteps: The total number of samples (env steps) to train on
         :param callback: callback(s) called at every step with state of the algorithm.
-        :param log_interval: The number of timesteps before logging.
+        :param log_interval: The number of episodes before logging.
         :param tb_log_name: the name of the run for TensorBoard logging
         :param eval_env: Environment that will be used to evaluate the agent
         :param eval_freq: Evaluate the agent every ``eval_freq`` timesteps (this may vary a little)
